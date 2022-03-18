@@ -8,6 +8,12 @@ This project explores three methods of manipulating pre-trained StyleGAN [1] mod
 
 ★★★ [Project Report](./project_report.pdf) ★★★ 
 
+
+
+https://user-images.githubusercontent.com/74963879/158951438-41384984-8333-4f77-81a1-63d32076c1cd.mp4
+
+
+
 ## Implementation    
 
 #### Requirements  
