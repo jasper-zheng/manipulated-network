@@ -6,7 +6,7 @@ Jasper Zheng (Shuoyang) / 21009460
 
 This project explores three methods of manipulating pre-trained StyleGAN [1] models: intermediate latent space truncation [2], layers' weights manipulation and Network Bending [3]. It also used VGG16 feature extraction model and KMean algorithm to cluster the feature maps in the intermediate layers to create more interpretable outcomes. Finally, it re-implemented a set of network bending operations to a code interface and showcased a series of novel images produced by the manipulated models.  
 
-★★★ [Project Report](./project_report.pdf) ★★★ 
+★★★ [Project Report](./project_report.pdf) ★★★
 
 
 
@@ -112,3 +112,21 @@ model.rebuild_operations(clusters, operations)
 y = model.generate_from_vector_fast(latents,is_visualize=False)
 
 ```
+
+## References  
+
+
+T. Broad, F. Leymarie and M. Grierson, "Network Bending: Expressive Manipulation of Deep Generative Models", arXiv.org, 2022. [Online]. Available: https://arxiv.org/abs/2005.12420. [Accessed: 18- Mar- 2022].
+
+T. Karras, S. Laine and T. Aila, "A Style-Based Generator Architecture for Generative Adversarial Networks", arXiv.org, 2022. [Online]. Available: https://arxiv.org/abs/1812.04948. [Accessed: 18- Mar- 2022].  
+
+D. Bau, S. Liu, T. Wang, J. Zhu and A. Torralba, "Rewriting a Deep Generative Model", arXiv.org, 2022. [Online]. Available: https://arxiv.org/abs/2007.15646. [Accessed: 18- Mar- 2022].  
+
+O. Katzir, V. Perepelook, D. Lischinski and D. Cohen-Or, "Multi-level Latent Space Structuring for Generative Control", arXiv.org, 2022. [Online]. Available: https://arxiv.org/abs/2202.05910. [Accessed: 18- Mar- 2022].  
+
+
+K. Simonyan and A. Zisserman, "Very Deep Convolutional Networks for Large-Scale Image Recognition", arXiv.org, 2022. [Online]. Available: https://arxiv.org/abs/1409.1556. [Accessed: 18- Mar- 2022].  
+
+Y. Shen, J. Gu, X. Tang and B. Zhou, "Interpreting the Latent Space of GANs for Semantic Face Editing", arXiv.org, 2022. [Online]. Available: https://arxiv.org/abs/1907.10786. [Accessed: 18- Mar- 2022].  
+
+I. Alhashim and T. Andrey, "StyleGAN-Tensorflow2: StyleGAN - TensorFlow 2.0 implementation", GitHub, 2022. [Online]. Available: https://github.com/ialhashim/StyleGAN-Tensorflow2. [Accessed: 18- Mar- 2022].    
