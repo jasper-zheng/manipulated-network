@@ -1,0 +1,1019 @@
+import math
+import numpy as np
+import tensorflow as tf
+import tensorflow_addons as tfa
+
+import matplotlib.pyplot as plt
+
+from tensorflow.keras import Model, Sequential
+from tensorflow.keras.layers import Layer, InputLayer, Multiply, Lambda, Flatten, Dense, Conv2D, Conv2DTranspose,BatchNormalization, GaussianNoise
+from tensorflow.keras.initializers import VarianceScaling
+
+from tensorflow.python.keras import backend
+from tensorflow.python.ops import array_ops
+
+def nf(stage, fmap_base=8192, fmap_decay=1.0, fmap_max=512): 
+    return min(int(fmap_base / (2.0 ** (stage * fmap_decay))), fmap_max)
+
+def LeakyReLU(alpha, name):
+    def lrelu(x, alpha):
+        alpha = tf.constant(alpha, dtype=x.dtype, name='alpha')
+        return tf.maximum(x, x * alpha)
+    return Lambda(lambda x: lrelu(x, alpha), name=name)
+
+def GetWeights(gain=math.sqrt(2)):
+    return VarianceScaling(gain)
+
+def runtime_coef(kernel_size, gain, fmaps_in, fmaps_out, lrmul=1.0):
+    # Equalized learning rate and custom learning rate multiplier.
+    shape = [kernel_size[0], kernel_size[1], fmaps_in, fmaps_out]
+    fan_in = np.prod(shape[:-1]) # [kernel, kernel, fmaps_in, fmaps_out] or [in, out]
+    he_std = gain / np.sqrt(fan_in) # He init
+    init_std = 1.0 / lrmul
+    return he_std * lrmul 
+
+def pixel_norm(x, epsilon=1e-8):
+    epsilon = tf.constant(epsilon, dtype=x.dtype, name='epsilon')
+    return x * tf.math.rsqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + epsilon)
+
+class PixelNorm(Layer):
+    def __init__(self, name):
+        super(PixelNorm, self).__init__(name=name)
+    
+    def call(self, inputs):
+        return pixel_norm(inputs)
+    
+class InstanceNorm(Layer):
+    def __init__(self, name):
+        super(InstanceNorm, self).__init__(name=name)
+    
+    def call(self, x):
+        epsilon=1e-8
+        orig_dtype = x.dtype
+        x = tf.cast(x, tf.float32)
+        x -= tf.reduce_mean(x, axis=[2,3], keepdims=True)
+        epsilon = tf.constant(epsilon, dtype=x.dtype, name='epsilon')
+        x *= tf.math.rsqrt(tf.reduce_mean(tf.square(x), axis=[2,3], keepdims=True) + epsilon)
+        x = tf.cast(x, orig_dtype)
+        return x
+    
+def Identity(name):
+    return Lambda(lambda x: x, name=name)
+
+def Broadcast(name, dlatent_broadcast=18):
+    def broadcast(x):
+        return tf.tile(x[:, np.newaxis], [1, dlatent_broadcast, 1])
+    return Lambda(lambda x: broadcast(x), name=name)
+
+class Truncation(Layer):
+    def __init__(self, name, num_layers=18, truncation_psi=0.7, truncation_cutoff=8):
+        super(Truncation, self).__init__(name=name)
+        self.num_layers = num_layers
+        self.truncation_psi = truncation_psi
+        self.truncation_cutoff = truncation_cutoff
+
+    def build(self, input_shape):
+        self.dlatent_avg = self.add_weight('dlatent_avg', shape=[input_shape[-1]])
+
+    def call(self, inputs):
+        layer_idx = np.arange(self.num_layers)[np.newaxis, :, np.newaxis]
+        ones = np.ones(layer_idx.shape, dtype=np.float32)
+        coefs = tf.where(layer_idx < self.truncation_cutoff, self.truncation_psi * ones, ones)
+        
+        def lerp(a,b,t): return a + (b - a) * t
+        
+        return lerp(self.dlatent_avg, inputs, coefs)
+
+class DenseLayer(Dense):
+    def __init__(self, units, name, kernel_initializer=GetWeights(), gain=math.sqrt(2), lrmul=1.0):
+        super(DenseLayer, self).__init__(units=units, kernel_initializer=kernel_initializer, name=name)
+        self.gain = gain
+        self.lrmul = lrmul
+    
+    def call(self, inputs):
+        x, b, w = inputs, self.bias * self.lrmul, self.kernel * runtime_coef([1,1], self.gain, inputs.shape[1], self.units, lrmul=self.lrmul)
+        
+        # Input x kernel
+        if len(x.shape) > 2: x = tf.reshape(x, [-1, np.prod([d for d in x.shape[1:]])])
+        x = tf.matmul(x, w)
+        
+        # Bias
+        if len(x.shape) == 2:
+            return x + b
+        
+        return x + tf.reshape(b, [1, -1, 1, 1])
+
+class Conv2d(Conv2D):
+    def __init__(self, filters, kernel_size, name, gain=math.sqrt(2), lrmul=1.0, kernel_modifier=None, strides=1, use_bias=True):
+        super(Conv2d, self).__init__(filters=filters, kernel_size=kernel_size, kernel_initializer=GetWeights(gain), 
+                                     use_bias=use_bias, padding='same', data_format='channels_first', name=name, strides=strides)
+        self.gain = gain
+        self.lrmul = lrmul
+        self.kernel_modifier = kernel_modifier
+
+    # Perform convolution with modified kernel then add bias
+    def call(self, inputs):
+        if self.kernel_modifier is None:
+            w = self.kernel
+        else:
+            w = self.kernel_modifier(self.kernel)
+            
+        outputs = self._convolution_op(inputs, w * runtime_coef(self.kernel_size, self.gain, inputs.shape[1], self.filters))
+        
+        if self.use_bias:
+            b = self.bias * self.lrmul        
+            if self.data_format == 'channels_first':
+                outputs = tf.nn.bias_add(outputs, b, data_format='NCHW')
+            else:
+                outputs = tf.nn.bias_add(outputs, b, data_format='NHWC')
+
+        return outputs
+
+class Const(Layer):
+    def __init__(self, name):
+        super(Const, self).__init__(name=name)
+        
+    def build(self, input_shape):
+        self.const = self.add_weight('const', shape=[1,512,4,4])
+        
+    def call(self, inputs):
+        return tf.tile(self.const, [tf.shape(inputs)[0], 1, 1, 1])
+    
+class RandomNoise(Layer):
+    def __init__(self, name, layer_idx):
+        super(RandomNoise, self).__init__(name=name)
+        
+        res = layer_idx // 2 + 2        
+        self.layer_idx = layer_idx
+        self.noise_shape = [1, 1, 2**res, 2**res]
+    
+    def build(self, input_shape):
+        self.noise = self.add_weight('noise', shape=self.noise_shape, initializer=tf.initializers.zeros(), trainable=False)
+        
+    def call(self, inputs):
+        return self.noise
+    
+class ApplyNoise(Layer):
+    def __init__(self, name):
+        super(ApplyNoise, self).__init__(name=name)        
+
+    def build(self, input_shape):
+        input_shape = input_shape[0]
+        self.weight = self.add_weight('weight', shape=[input_shape[1]], initializer=tf.initializers.zeros())
+        
+    def call(self, inputs):        
+        #noise = tf.random_normal([tf.shape(x)[0], 1, x.shape[2], x.shape[3]], dtype=x.dtype)
+        x, noise = inputs
+        
+        return x + noise * tf.reshape(self.weight, [1, -1, 1, 1])
+    
+class ApplyBias(Layer):
+    def __init__(self, name, lrmul=1.0):
+        super(ApplyBias, self).__init__(name=name)
+        self.lrmul = lrmul
+        
+    def build(self, input_shape):
+        self.bias = self.add_weight('bias', shape=[input_shape[1]])
+        
+    def call(self, x):
+        b = self.bias * self.lrmul
+        if len(x.shape) == 2: return x + b
+        return x + tf.reshape(b, [1, -1, 1, 1])
+
+class StridedSlice(Layer):
+    def __init__(self, layer_idx, name):
+        super(StridedSlice, self).__init__(name=name)
+        self.layer_idx = layer_idx
+    
+    def call(self, inputs):
+        return inputs[:, self.layer_idx]
+    
+class StyleModApply(Layer):
+    def __init__(self, name):
+        super(StyleModApply, self).__init__(name=name)
+    
+    def call(self, inputs):
+        x, style = inputs
+        
+        style = tf.reshape(style, [-1, 2, x.shape[1]] + [1] * (len(x.shape) - 2))
+        return x * (style[:,0] + 1) + style[:,1]
+
+def _blur2d(x, f=[1,2,1], normalize=True, flip=False, stride=1):
+    assert x.shape.ndims == 4 and all(dim is not None for dim in x.shape[1:])
+    assert isinstance(stride, int) and stride >= 1
+
+    # Finalize filter kernel.
+    f = np.array(f, dtype=np.float32)
+    if f.ndim == 1:
+        f = f[:, np.newaxis] * f[np.newaxis, :]
+    assert f.ndim == 2
+    if normalize:
+        f /= np.sum(f)
+    if flip:
+        f = f[::-1, ::-1]
+    f = f[:, :, np.newaxis, np.newaxis]
+    f = np.tile(f, [1, 1, int(x.shape[1]), 1])
+
+    # No-op => early exit.
+    if f.shape == (1, 1) and f[0,0] == 1:
+        return x
+
+    # Convolve using depthwise_conv2d.
+    orig_dtype = x.dtype
+    x = tf.cast(x, tf.float32)  # tf.nn.depthwise_conv2d() doesn't support fp16
+    f = tf.constant(f, dtype=x.dtype, name='filter')
+    strides = [1, 1, stride, stride]
+    x = tf.nn.depthwise_conv2d(x, f, strides=strides, padding='SAME', data_format='NCHW')
+    x = tf.cast(x, orig_dtype)
+    return x
+
+def Blur(name, blur_filter=[1,2,1]):
+    def blur2d(x, f=[1,2,1], normalize=True):
+        return _blur2d(x, f, normalize)
+    return Lambda(lambda x: blur2d(x, blur_filter), name=name)
+
+def _downscale2d(x, factor=2, gain=1):
+    assert x.shape.ndims == 4 and all(dim is not None for dim in x.shape[1:])
+    assert isinstance(factor, int) and factor >= 1
+
+    # 2x2, float32 => downscale using _blur2d().
+    if factor == 2 and x.dtype == tf.float32:
+        f = [np.sqrt(gain) / factor] * factor
+        return _blur2d(x, f=f, normalize=False, stride=factor)
+
+    # Apply gain.
+    if gain != 1:
+        x *= gain
+
+    # No-op => early exit.
+    if factor == 1:
+        return x
+
+    # Large factor => downscale using tf.nn.avg_pool().
+    # NOTE: Requires tf_config['graph_options.place_pruned_graph']=True to work.
+    ksize = [1, 1, factor, factor]
+    return tf.nn.avg_pool(x, ksize=ksize, strides=ksize, padding='VALID', data_format='NCHW')
+
+def _upscale2d(x, factor=2, gain=1):
+    assert x.shape.ndims == 4 and all(dim is not None for dim in x.shape[1:])
+    assert isinstance(factor, int) and factor >= 1
+
+    # Apply gain.
+    if gain != 1:
+        x *= gain
+
+    # No-op => early exit.
+    if factor == 1:
+        return x
+
+    # Upscale using tf.tile().
+    s = x.shape
+    x = tf.reshape(x, [-1, s[1], s[2], 1, s[3], 1])
+    x = tf.tile(x, [1, 1, 1, factor, 1, factor])
+    x = tf.reshape(x, [-1, s[1], s[2] * factor, s[3] * factor])
+    return x
+	
+def Downscaled2d(name, factor=2, gain=1):
+    return Lambda(lambda x: _downscale2d(x, factor, gain), name=name+'/Downscaled2d')
+	
+def Upscaled2d(name, factor=2, gain=1):
+    return Lambda(lambda x: _upscale2d(x, factor, gain), name=name+'/Upscaled2d')
+
+def Conv2d_downscale2d(model, filters, kernel_size, name, gain=math.sqrt(2), fused_scale='auto'):
+    if fused_scale == 'auto':
+        x = model.layers[-1].output
+        fused_scale = min(x.shape[2:]) >= 128
+        
+    if not fused_scale:
+        # Not fused => call the individual ops directly.
+        model.add( Conv2d(filters, kernel_size, name, gain) )
+        model.add( Downscaled2d(name) )        
+    else:
+        # Fused => perform both ops simultaneously using tf.nn.conv2d().
+        def fused_op(w):
+            w = tf.pad(w, [[1,1], [1,1], [0,0], [0,0]], mode='CONSTANT')
+            w = tf.add_n([w[1:, 1:], w[:-1, 1:], w[1:, :-1], w[:-1, :-1]]) * 0.25
+            return w
+        model.add( Conv2d(filters, kernel_size, name, gain, kernel_modifier=fused_op, strides=2) )
+		
+def Upscale2d_conv2d(x, filters, kernel_size, name, use_bias, gain=math.sqrt(2), fused_scale='auto'):
+    if fused_scale == 'auto':
+        fused_scale = min(x.shape[2:]) * 2 >= 128
+
+    if not fused_scale:
+        x = Upscaled2d(name)(x)
+        x = Conv2d(filters, kernel_size, name=name, gain=gain, use_bias=use_bias)(x)
+        return x
+
+    return Conv2d_transpose(filters, kernel_size, name, gain, strides=2)(x)
+
+class Conv2d_transpose(Conv2DTranspose):
+    def __init__(self, filters, kernel_size, name, gain=math.sqrt(2), lrmul=1.0, kernel_modifier=None, strides=2, use_bias=False):
+        
+        super(Conv2d_transpose, self).__init__(filters=filters, kernel_size=kernel_size, kernel_initializer=GetWeights(gain), 
+                                     use_bias=use_bias, padding='same', data_format='channels_first', name=name, strides=strides)
+        self.gain = gain
+        self.lrmul = lrmul
+        self.kernel_modifier = kernel_modifier
+        
+    def build(self, input_shape):
+        shape = [self.kernel_size[0], self.kernel_size[1], input_shape[1], self.filters]
+        self.kernel = self.add_weight('weight', shape=shape, initializer=tf.initializers.zeros())
+            
+    def call(self, inputs):
+        # Fused => perform both ops simultaneously using tf.nn.conv2d_transpose().
+        def fused_op(w):
+            w = tf.transpose(w, [0, 1, 3, 2]) # [kernel, kernel, fmaps_out, fmaps_in]
+            w = tf.pad(w, [[1,1], [1,1], [0,0], [0,0]], mode='CONSTANT')
+            w = tf.add_n([w[1:, 1:], w[:-1, 1:], w[1:, :-1], w[:-1, :-1]])
+            return w
+
+        x, w = inputs, fused_op(self.kernel * runtime_coef(self.kernel_size, self.gain, inputs.shape[1], self.filters, lrmul=self.lrmul))
+        
+        os = [tf.shape(inputs)[0], self.filters, inputs.shape[2] * 2, inputs.shape[3] * 2]
+        
+        outputs = tf.nn.conv2d_transpose(x, w, os, strides=[1,1,2,2], padding='SAME', data_format='NCHW')
+        
+        return outputs
+
+def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
+    with tf.variable_scope('MinibatchStddev'):
+        group_size = tf.minimum(group_size, tf.shape(x)[0])     # Minibatch must be divisible by (or smaller than) group_size.
+        s = x.shape                                             # [NCHW]  Input shape.
+        y = tf.reshape(x, [group_size, -1, num_new_features, s[1]//num_new_features, s[2], s[3]])   # [GMncHW] Split minibatch into M groups of size G. Split channels into n channel groups c.
+        y = tf.cast(y, tf.float32)                              # [GMncHW] Cast to FP32.
+        y -= tf.reduce_mean(y, axis=0, keepdims=True)           # [GMncHW] Subtract mean over group.
+        y = tf.reduce_mean(tf.square(y), axis=0)                # [MncHW]  Calc variance over group.
+        y = tf.sqrt(y + 1e-8)                                   # [MncHW]  Calc stddev over group.
+        y = tf.reduce_mean(y, axis=[2,3,4], keepdims=True)      # [Mn111]  Take average over fmaps and pixels.
+        y = tf.reduce_mean(y, axis=[2])                         # [Mn11] Split channels into c channel groups
+        y = tf.cast(y, x.dtype)                                 # [Mn11]  Cast back to original data type.
+        y = tf.tile(y, [group_size, 1, s[2], s[3]])             # [NnHW]  Replicate over group and pixels.
+        return tf.concat([x, y], axis=1)                        # [NCHW]  Append as new fmap.
+		
+def StyleGAN_G_mapping( latent_size=512, dlatent_size=512, mapping_layers=8, mapping_fmaps=512, mapping_lrmul=0.01 ):
+    model = Sequential(name='G_mapping')
+    model.add( InputLayer(input_shape=[latent_size], name='G_mapping/latents_in') ) 
+
+    # Normalize latents.
+    model.add( PixelNorm(name='G_mapping/PixelNorm') )
+    
+    # Mapping layers.
+    for layer_idx in range(mapping_layers):
+        name = 'G_mapping/Dense{}'.format(layer_idx)
+        fmaps = dlatent_size if layer_idx == mapping_layers - 1 else mapping_fmaps
+        
+        model.add( DenseLayer(units=fmaps, kernel_initializer=GetWeights(), name=name, lrmul=mapping_lrmul) )
+        model.add( LeakyReLU(alpha=0.2, name=name+'/LeakyReLU') )
+        
+    # Broadcast.
+    model.add( Broadcast(name='G_mapping/Broadcast') )
+    
+    # Output.
+    model.add( Identity(name='G_mapping/dlatents_out') )
+    
+    # Apply truncation trick.
+    model.add( Truncation(name='Truncation') )
+    
+    return model
+
+
+class Rot(tf.keras.layers.Layer):
+  def __init__(self, name):
+    super(Rot, self).__init__(name=name)
+
+  def call(self, inputs):
+    trans_1 = tf.transpose(inputs, [0,2,3,1])
+    rot = tf.image.rot90(trans_1,k=1)
+    trans_2 = tf.transpose(rot,[0,3,1,2])
+    return trans_2
+
+class Invert(tf.keras.layers.Layer):
+  def __init__(self, name):
+    super(Invert, self).__init__(name=name)
+
+  def call(self, inputs):
+    return -inputs
+
+class Brightness(tf.keras.layers.Layer):
+  def __init__(self, name):
+    super(Brightness, self).__init__(name=name)
+
+  def call(self, inputs):
+    return tf.image.adjust_brightness(inputs, delta=50)
+
+
+class Translate(tf.keras.layers.Layer):
+  def __init__(self, name, translateX=0,translateY=0):
+    super(Translate, self).__init__(name=name)
+    self.translateX = translateX
+    self.translateY = translateY
+    
+  def call(self, inputs):
+    trans_1 = tf.transpose(inputs, [1,2,3,0])
+    rot = tfa.image.translate(trans_1,[self.translateX,self.translateY], interpolation='nearest', fill_mode='reflect')
+    trans_2 = tf.transpose(rot,[3,0,1,2])  
+    trans_2.set_shape(inputs.shape)
+    return trans_2
+
+  def build(self,input_shape):
+      self.compute_output_shape(input_shape)
+      
+  def compute_output_shape(self, inputs):
+    self._spatial_output_shape(inputs)
+    return inputs
+
+  def _spatial_output_shape(self, spatial_input_shape):
+    return spatial_input_shape
+
+class Darkness(tf.keras.layers.Layer):
+  def __init__(self, name):
+    super(Darkness, self).__init__(name=name)
+
+  def call(self, inputs):
+    return tf.image.adjust_brightness(inputs, delta=-50)
+
+
+class Sin_disrupt(tf.keras.layers.Layer):
+  def __init__(self, name):
+    super(Sin_disrupt, self).__init__(name=name)
+
+  def call(self, inputs):
+    base = np.zeros((1,512,8,8))
+    w = inputs.shape[2]
+    h = inputs.shape[3]
+    for x in range(w):
+        for y in range(h):
+            base[:,:,x,y] += (np.sin(x/w)+1)/6
+            base[:,:,x,y] += (np.sin(y/w)+1)/6
+    return tf.convert_to_tensor(base,dtype=tf.float32)
+
+  def build(self,input_shape):
+      self.compute_output_shape(input_shape)
+      
+  def compute_output_shape(self, inputs):
+    self._spatial_output_shape(inputs)
+    return inputs
+
+  def _spatial_output_shape(self, spatial_input_shape):
+    return spatial_input_shape
+
+
+class RepeatX(tf.keras.layers.Layer):
+  def __init__(self, name):
+    super(RepeatX, self).__init__(name=name)
+
+  def call(self, inputs):
+    print(inputs.shape)
+    #out = tf.repeat(inputs[:,:,:int(inputs.shape[2]/2),:],repeats=2,axis=2)
+    out = tf.concat([inputs[:,:,:,:2],
+                     inputs[:,:,:,:2]
+                     ],axis=3)
+    print(out.shape)
+    return out
+
+  def build(self,input_shape):
+      self.compute_output_shape(input_shape)
+      
+  def compute_output_shape(self, inputs):
+    self._spatial_output_shape(inputs)
+    return inputs
+
+  def _spatial_output_shape(self, spatial_input_shape):
+    return spatial_input_shape
+
+class RepeatY(tf.keras.layers.Layer):
+  def __init__(self, name):
+    super(RepeatY, self).__init__(name=name)
+
+  def call(self, inputs):
+    print(inputs.shape)
+    #out = tf.repeat(inputs[:,:,:int(inputs.shape[2]/2),:],repeats=2,axis=2)
+    out = tf.concat([inputs[:,:,:1,:],
+                     inputs[:,:,:1,:],
+                     inputs[:,:,:1,:],
+                     inputs[:,:,:1,:]
+                     ],axis=2)
+    print(out.shape)
+    return out
+
+  def build(self,input_shape):
+      self.compute_output_shape(input_shape)
+      
+  def compute_output_shape(self, inputs):
+    self._spatial_output_shape(inputs)
+    return inputs
+
+  def _spatial_output_shape(self, spatial_input_shape):
+    return spatial_input_shape
+
+class Shuffle(tf.keras.layers.Layer):
+  def __init__(self, name):
+    super(Shuffle, self).__init__(name=name)
+
+  def call(self, inputs):
+    outs_t = tf.transpose(inputs,[1,2,3,0])
+    r_t = tf.random.shuffle(outs_t,seed=1)
+    r = tf.transpose(r_t,[3,0,1,2])
+    return r
+
+class Scale(tf.keras.layers.Layer):
+  def __init__(self, name, scale):
+    super(Scale, self).__init__(name=name)
+    self.scale = scale
+    
+  def call(self, inputs):
+    base_t = tf.transpose(inputs,[1,2,3,0])
+    x = inputs.shape[-1]
+    x_new = int(inputs.shape[-1]+self.scale)
+    base_re = tf.image.resize(base_t, [x_new,x_new], method='gaussian')
+    print(x)
+    print(x_new)
+    base_crop = tf.image.resize_with_crop_or_pad(base_re,x,x)
+    base_crop_t = tf.transpose(base_crop,[3,0,1,2])
+    return base_crop_t
+
+
+class Block(tf.keras.layers.Layer):
+  def __init__(self, name,sequences=[], operation='scale', scale=1, translateX=0,translateY=0,filter_shape=3,rotation=0,sharpen_factor=1):
+    super(Block, self).__init__(name=name)
+    self.sequences=sequences
+    self.operation=operation
+    self.scale = scale
+    self.translateX = translateX
+    self.translateY = translateY
+    self.filter_shape = filter_shape
+    self.rotation = rotation
+    self.sharpen_factor = sharpen_factor
+
+  def call(self, inputs):
+      
+    ones = tf.ones(tf.shape(inputs))
+    diag = tf.cast(tf.linalg.diag(self.sequences), tf.float32)
+    #inputs += tf.ones(tf.shape(inputs))
+    scaled = tf.tensordot(diag,tf.transpose(ones,[1,2,3,0]),axes=1)
+    #inputs -= tf.ones(tf.shape(inputs))
+    mask = tf.cast(tf.transpose(scaled,[3,0,1,2]),dtype=tf.bool)
+    print(mask.shape)
+    
+    if self.operation=='block':  
+        print('operation: block')
+        
+        diag = tf.cast(tf.linalg.diag(self.sequences), tf.float32)
+        #inputs += tf.ones(tf.shape(inputs))
+        scaled = tf.tensordot(diag,tf.transpose(inputs,[1,2,3,0]),axes=1)
+        #inputs -= tf.ones(tf.shape(inputs))
+        out = tf.transpose(scaled,[3,0,1,2])
+        
+    elif self.operation=='scale':
+        
+        print('operation: scale')
+        
+        base_t = tf.transpose(inputs,[1,2,3,0])
+        x = inputs.shape[-1]
+        x_new = int(inputs.shape[-1]+self.scale)
+        base_re = tf.image.resize(base_t, [x_new,x_new], method='gaussian')
+        print(x)
+        print(x_new)
+        base_crop = tf.image.resize_with_crop_or_pad(base_re,x,x)
+        base_crop_t = tf.transpose(base_crop,[3,0,1,2])
+        
+        
+        masked_y = tf.where(mask,base_crop_t,inputs)
+        out = masked_y
+        
+        '''
+        mask = tf.convert_to_tensor(self.sequences, dtype=tf.bool)
+        mask_exp = tf.expand_dims(tf.expand_dims(mask,0),0)
+        mask_repeat = tf.repeat(tf.repeat(mask_exp,repeats=[8],axis=0),repeats=[8],axis=1)
+        mask_t = tf.transpose(mask_repeat,[2,0,1])
+        place = tf.fill(tf.shape(inputs[:,0,0,0]), mask_t)
+        print(place.shape)
+        out = place
+        '''
+    elif self.operation=='invert':
+        print('operation: invert')
+        inverted = -inputs
+        
+        masked_y = tf.where(mask,inverted,inputs)
+        out = masked_y
+        
+    elif self.operation=='shuffle':
+        print('operation: shuffle')
+        
+        outs_t = tf.transpose(inputs,[1,2,3,0])
+        r_t = tf.random.shuffle(outs_t,seed=1)
+        r = tf.transpose(r_t,[3,0,1,2])
+        
+        out = tf.where(mask,r,inputs)
+        
+    elif self.operation =='darken':
+        print('operation: darken')
+        r = tf.image.adjust_brightness(inputs, delta=-30)
+        
+        out = tf.where(mask,r,inputs)
+    elif self.operation =='translate':
+        print(f'operation: translate[{self.translateX}, {self.translateY}]')
+        
+        trans_1 = tf.transpose(inputs, [1,2,3,0])
+        rot = tfa.image.translate(trans_1,[self.translateX,self.translateY], interpolation='nearest', fill_mode='reflect')
+        trans_2 = tf.transpose(rot,[3,0,1,2])  
+        trans_2.set_shape(inputs.shape)
+        
+        out = tf.where(mask,trans_2,inputs)
+    elif self.operation=='fill':
+        print('operation: fill')
+        
+        pattern = np.where(self.sequences==1)
+        
+        based_t = tf.transpose(inputs,[1,2,3,0])
+        based_sliced = tf.gather(based_t,pattern[0])
+        
+        lens = tf.shape(based_sliced)[0]
+        print(lens)
+        
+        based_repeat = tf.repeat(based_sliced,int(512/lens),axis=0)
+        print(f'sliced {based_sliced.shape}')
+        based_full = tf.concat([based_repeat,based_sliced[:512%lens]], axis=0)
+        out_filled = tf.transpose(based_full,[3,0,1,2])
+        
+        out = tf.where(mask,inputs,out_filled)
+    elif self.operation=='mean_filter':
+        print('operation: mean_filter')
+        trans_1 = tf.transpose(inputs, [1,2,3,0])
+        filtered = tfa.image.mean_filter2d(trans_1,filter_shape = (self.filter_shape,self.filter_shape))
+        trans_2 = tf.transpose(filtered,[3,0,1,2])  
+        trans_2.set_shape(inputs.shape)
+        
+        out = tf.where(mask,trans_2,inputs)
+    elif self.operation=='rotate':
+        print(f'operation: rotate {self.rotation}')
+        trans_1 = tf.transpose(inputs, [1,2,3,0])
+        rotated = tfa.image.rotate(trans_1, tf.constant(self.rotation),fill_mode='reflect')
+        trans_2 = tf.transpose(rotated,[3,0,1,2])  
+        trans_2.set_shape(inputs.shape)
+        
+        out = tf.where(mask,trans_2,inputs)
+        
+        pass
+    elif self.operation=='sharpen':
+        print(f'operation: sharpen {self.sharpen_factor}')
+        trans_1 = tf.transpose(inputs, [1,2,3,0])
+        print(trans_1.shape)
+        sharpen = tfa.image.sharpness(trans_1, tf.constant(self.sharpen_factor,dtype=tf.float32))
+        trans_2 = tf.transpose(sharpen,[3,0,1,2])  
+        trans_2.set_shape(inputs.shape)
+        
+        out = tf.where(mask,trans_2,inputs)
+        
+    else:
+        print('no operation!!!!')
+        
+    return out
+
+  def build(self,input_shape):
+      self.compute_output_shape(input_shape)
+      
+  def compute_output_shape(self, inputs):
+    self._spatial_output_shape(inputs)
+    return inputs
+
+  def _spatial_output_shape(self, spatial_input_shape):
+    return spatial_input_shape
+
+
+
+
+
+def StyleGAN_G_synthesis(dlatent_size=512, resolution=1024, block_sequence=None):
+    # General parameters
+    num_channels = 3
+    resolution_log2 = int(np.log2(resolution))
+    num_layers = resolution_log2 * 2 - 2
+    num_styles = num_layers
+    
+    # Primary inputs.
+    dlatents_in = tf.keras.layers.Input(shape=[num_styles, dlatent_size], name='G_synthesis/dlatents_in')
+    
+    # Noise inputs.
+    noise_inputs = []
+    for layer_idx in range(num_layers):
+        noise_inputs.append( RandomNoise(name='G_synthesis/noise%d'%layer_idx, layer_idx=layer_idx)(dlatents_in) )
+        
+    # Things to do at the end of each layer.
+    def layer_epilogue(x, layer_idx, name, res=0, block_sequence=None):
+        name = 'G_synthesis/{}x{}/{}/'.format(x.shape[2], x.shape[2], name)
+
+        if x.shape[2]==32 and 'Conv0_up' in name:
+            pass
+            #print('rot')
+            #x = Scale(name='scale'+name,scale=0.8)(x)
+            
+
+        
+        x = ApplyNoise(name=name+'Noise')([x, noise_inputs[layer_idx]])        
+        x = ApplyBias(name=name+'bias')(x)
+
+        
+        x = LeakyReLU(alpha=0.2, name=name+'LeakyReLU')(x)
+        
+        if x.shape[2]==8 and not block_sequence is None:
+            pass
+        '''
+            print('block 8x8 after norm')
+            
+            x = Block(name='block_8x8_label_01',
+                      sequences=block_sequence,
+                      operation='scale',
+                      scale=1.4,
+                      translateX=0,
+                      translateY=-2)(x)
+        
+            #x = Translate('translate')(x)
+        '''
+        if x.shape[2]==16 and not block_sequence is None and 'Conv0_up' in name:
+           print(f'block after {name} before norm') 
+           #x = Translate('translate',translateX=0,translateY=0)(x)
+           x = Block(name='block_16x16',
+                     sequences=block_sequence,
+                     operation='mean_filter',
+                     scale=-4,
+                     translateX=0,
+                     translateY=2,
+                     filter_shape=3,
+                     rotation=np.pi/4,
+                     sharpen_factor=10)(x)
+           x = InstanceNorm(name=name+'InstanceNorm1')(x)
+           #x = Scale('scale', scale=-8)(x)
+           x = Block(name='block_16x16_2',
+                     sequences=block_sequence,
+                     operation='mean_filter',
+                     filter_shape=4)(x)
+           x = InstanceNorm(name=name+'InstanceNorm4')(x)
+           x = Block(name='block_16x16_3',
+                     sequences=block_sequence,
+                     operation='mean_filter',
+                     filter_shape=5)(x)
+           x = InstanceNorm(name=name+'InstanceNorm2')(x)
+           x = Block(name='block_16x16_4',
+                     sequences=block_sequence,
+                     operation='mean_filter',
+                     filter_shape=5)(x)
+           x = InstanceNorm(name=name+'InstanceNorm3')(x)
+           x = Block(name='block_16x16_5',
+                     sequences=np.ones((512,)),
+                     operation='sharpen',
+                     sharpen_factor=np.random.random()/100,
+                     filter_shape=5)(x)
+           #x = InstanceNorm(name=name+'InstanceNorm5')(x)
+           x = Scale('scale', scale=-4)(x)
+           x = Rot('rot')(x)
+        x = InstanceNorm(name=name+'InstanceNorm')(x)      
+        
+        
+
+        
+        ######################################################
+        
+        if res == 3:
+            #x = Translate(name='bright')(x)
+            pass
+            #x = Shuffle(name='shuffle')(x)
+            #x = RepeatX(name='repeatX')(x)
+            #x = RepeatY(name='repeatY')(x)
+            #seq = np.ones((512,))
+            #seq[:500]=np.zeros((500,))
+            #x = Block(name='block',sequences=block_sequence)(x)
+            
+        ######################################################
+        style = DenseLayer(units=x.shape[1]*2, gain=1, name=name+'StyleMod') (StridedSlice(layer_idx, name=name+'StridedSlice')(dlatents_in))
+        if res == 2:
+            pass
+        else:
+            x = StyleModApply(name=name+'StyleModApply')([x, style])
+        
+        return x
+    
+    # Building blocks for remaining layers.
+    def block(res, x, block_sequence=None): # res = 3..resolution_log2
+        name, name0, name1 = '%dx%d' % (2**res, 2**res), 'Conv0_up', 'Conv1'
+        
+        # Conv0_up
+        upscaled = Upscale2d_conv2d(x, name='G_synthesis/{}/{}'.format(name, name0), filters=nf(res-1), kernel_size=3, use_bias=False)   
+        
+
+        
+        x = layer_epilogue( Blur(name='G_synthesis/{}/{}/Blur'.format(name, name0))(upscaled), 
+                           res*2-4, 
+                           name0,
+                           res = res,
+                           block_sequence = block_sequence)
+        
+        # Conv1
+        x = layer_epilogue( Conv2d(name='G_synthesis/{}/{}'.format(name, name1), filters=nf(res-1), kernel_size=3, use_bias=False)(x), 
+                           res*2-3, 
+                           name1, 
+                           block_sequence = block_sequence )
+        
+        '''
+        if name=='8x8' and block_sequence:
+            x = Block(name='block_8x8_label_01',sequences=block_sequence)(x)
+        '''
+        if name=='16x16' and not block_sequence is None:
+            pass
+            #print('block 16x16')
+            #x = Block(name='block_16x16_label_01',sequences=block_sequence)(x)
+        '''
+        if name=='8x8':
+            print('RepeatY')
+            x = RepeatY(name='repeatY')(x)
+            x = RepeatX(name='repeatX')(x)
+            '''
+        if res == 4:
+            pass
+            #x = layer_epilogue( Conv2d(name='G_synthesis/{}/{}_dup'.format(name, name1), filters=nf(res-1), kernel_size=3, use_bias=False)(x), res*2-3, name1+'_dup' )
+        return x 
+    
+    def torgb(res, x): # res = 2..resolution_log2
+        lod = resolution_log2 - res        
+        return Conv2d(name='G_synthesis/ToRGB_lod%d' % lod, filters=num_channels, kernel_size=1, gain=1, use_bias=True)(x)
+    
+    # Early layers.
+    x = layer_epilogue(Const(name='G_synthesis/4x4/Const')(dlatents_in), 0, name='Const',res=1)
+    x = layer_epilogue(Conv2d(name='G_synthesis/4x4/Conv', filters=nf(1), kernel_size=3, use_bias=False)(x), 1, 'Conv',res = 2)
+    #x = layer_epilogue(Conv2d(name='G_synthesis/4x4/Conv_dup', filters=nf(1), kernel_size=3, use_bias=False)(x), 1, 'Conv_dup',res = 2)
+    
+    # Fixed structure: simple and efficient, but does not support progressive growing.
+    for res in range(3, resolution_log2 + 1):
+        x = block(res, x, block_sequence=block_sequence)
+            
+    x = torgb(resolution_log2, x)
+    
+    return Model(inputs=dlatents_in, outputs=x, name='G_synthesis')
+    
+class StyleGAN_G(Model):
+    def __init__(self, resolution=1024, latent_size=512, dlatent_size=512, mapping_layers=8, mapping_fmaps=512, mapping_lrmul=0.01, block_sequence=None ):
+        super(StyleGAN_G, self).__init__()
+        self.model_mapping = StyleGAN_G_mapping(latent_size, dlatent_size, mapping_layers, mapping_fmaps, mapping_lrmul)
+        if block_sequence is None:
+            self.model_synthesis = StyleGAN_G_synthesis(dlatent_size, resolution)
+        else:
+            self.model_synthesis = StyleGAN_G_synthesis(dlatent_size, resolution,block_sequence)
+        print('Model created.')
+        
+    def call(self, inputs):
+        x = self.model_mapping(inputs)
+        x = self.model_synthesis(x)
+        return x
+    
+    def generate_sample(self, seed=5, is_visualize=False):
+        rnd = np.random.RandomState(seed)
+        latents = rnd.randn(1, 512)
+
+        y = self.predict(latents)
+
+        images = y.transpose([0, 2, 3, 1])
+        images = np.clip((images+1)*0.5, 0, 1)
+        
+        if is_visualize:
+            print(images.shape, np.min(images), np.max(images))
+
+            import matplotlib.pyplot as plt
+
+            plt.figure(figsize=(10,10))
+            plt.imshow(images[0])
+            plt.show()
+        
+        return images
+    
+    def generate_sample_from_vector(self, latents, is_visualize=False, is_clip = True):
+        y = self.predict(latents)
+        images = y.transpose([0, 2, 3, 1])
+        
+        if is_clip:
+            images = np.clip((images+1)*0.5, 0, 1)
+        
+        if is_visualize:
+            print(images.shape, np.min(images), np.max(images))
+    
+            plt.figure(figsize=(10,10))
+            plt.imshow(images[0])
+            plt.show()
+        
+        return images
+    
+class StyleGAN_D(Model):
+    def __init__(self, resolution=1024, mbstd_group_size=4, mbstd_num_features=1):
+        super(StyleGAN_D, self).__init__()
+
+        resolution_log2 = int(math.log2(resolution))
+
+        model = Sequential(name='Discriminator')
+        model.add(InputLayer(input_shape=[3, resolution, resolution])) 
+
+        def fromrgb(res):
+            name = 'FromRGB_lod%d' % (resolution_log2 - res)
+            model.add( Conv2d(filters=nf(res-1), kernel_size=1, name=name) )
+            model.add( LeakyReLU(alpha=0.2, name=name+'/LeakyReLU') )
+
+        def block(res):
+            name = '%dx%d' % (2**res, 2**res)
+            if res >= 3: # 8x8 and up
+                model.add( Conv2d(filters=nf(res-1), kernel_size=3, name=name+'/Conv0') )
+                model.add( LeakyReLU(alpha=0.2, name=name+'/Conv0/LeakyReLU') )
+
+                model.add( Blur(name=name+'/Blur') )
+                Conv2d_downscale2d(model=model, filters=nf(res-2), kernel_size=3, name=name+'/Conv1_down')
+                model.add( LeakyReLU(alpha=0.2, name=name+'/Conv1_down/LeakyReLU') )
+
+            else: # 4x4
+                if mbstd_group_size > 1: 
+                    model.add( Lambda(lambda x: minibatch_stddev_layer(x, mbstd_group_size, mbstd_num_features), name=name+'/MinibatchStddev') )
+
+                model.add( Conv2d(filters=nf(res-1), kernel_size=3, name=name+'/Conv') )
+                model.add( LeakyReLU(alpha=0.2, name=name+'/Conv/LeakyReLU') )
+
+                model.add( Flatten() )
+                model.add( DenseLayer(units=nf(res-2), kernel_initializer=GetWeights(), name=name+'/Dense0') )
+                model.add( LeakyReLU(alpha=0.2, name=name+'/Dense0/LeakyReLU') )
+
+                model.add( DenseLayer(units=1, kernel_initializer=GetWeights(1), gain=1, name=name+'/Dense1') )   
+
+        # Blocks
+        fromrgb(resolution_log2)
+        for res in range(resolution_log2, 2, -1): block(res)
+        block(2)
+
+        self.model = model
+
+    def call(self, inputs):
+        return self.model(inputs)
+
+def copy_weights_to_keras_model(model, all_weights):
+    c = 0
+    od = all_weights
+    for l in model.layers:
+        values = l.get_weights()
+        weights = list(map(lambda x: x.shape, values))
+        if not len(weights): continue
+
+        num_params = values[0].size
+
+        # Special weights
+        if len(weights) == 1:    
+            weights_list = []
+
+            # The learned constant variable
+            if l.name == 'G_synthesis/4x4/Const': weights_list.append( od[l.name+'/const'] )
+
+            # Truncation trick variable
+            if 'Truncation' in l.name: weights_list.append( od['dlatent_avg'] )
+
+            # Input noise
+            if 'G_synthesis/noise' in l.name: weights_list.append( od[l.name] ) 
+
+            # Noise variables
+            if 'Noise' in l.name and not 'dup' in l.name: weights_list.append( od[l.name+'/weight'] )
+            if 'Noise' in l.name and 'dup' in l.name: weights_list.append( od[l.name.replace('_dup','')+'/weight'] )
+            
+            # Bias variables
+            if 'bias' in l.name and not 'dup' in l.name: weights_list.append( od[l.name] )
+            if 'bias' in l.name and 'dup' in l.name: weights_list.append( od[l.name.replace('_dup','')] )
+
+            # Conv with no bias
+            if l.name.endswith('Conv') or l.name.endswith('Conv1') or l.name.endswith('Conv0_up'):
+                weights_list.append( od[l.name+'/weight'] )
+            
+            if l.name.endswith('_dup'):
+                weights_list.append( od[l.name.replace('_dup','')+'/weight'] )
+                
+            if len(weights_list) > 0:
+                l.set_weights( weights_list )
+                print('.', end='')
+                c = c + num_params
+            else:
+                print('WARNING: weights not found for ', l.name, '  of size', weights[0])
+        else:  
+        # Standard weights (weight + bias)
+            #assert len(weights) == 2
+
+            num_params = num_params + values[1].size
+
+            layer_name = l.name
+            
+            if layer_name.endswith('StyleMod'):
+                layer_name = layer_name.replace('_dup','')
+            var_names = ['{}/{}'.format(layer_name, 'weight'), '{}/{}'.format(layer_name, 'bias')]
+            
+            if var_names[0] in od and var_names[1] in od:
+                weight = od[var_names[0]]
+                bias = od[var_names[1]]
+
+                l.set_weights( [ weight, bias ] )
+
+                print('.', end='')
+                c = c + num_params
+            else:
+                print('WARNING: not found', var_names)
+
+    print('Total number of parameters copied:', c)
